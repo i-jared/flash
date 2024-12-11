@@ -203,22 +203,65 @@ func findSingleFlashFile() (string, error) {
 
 func main() {
 	if len(os.Args) < 2 {
-		// Try to find a single .flsh file
-		filename, err := findSingleFlashFile()
-		if err != nil {
+		// Show file selection menu
+		files, err := filepath.Glob("*.flsh")
+		if err != nil || len(files) == 0 {
 			fmt.Println("Usage:")
 			fmt.Println("  Review all cards: flash file.flsh")
 			fmt.Println("  Review wrong cards: flash review file.flsh")
 			fmt.Println("  Add card: flash add file.flsh")
-			fmt.Printf("Error: %v\n", err)
+			fmt.Println("  Create new file: flash new <name>")
 			os.Exit(1)
 		}
-		// Found single file, use it
-		os.Args = append(os.Args, filename)
+
+		// Initialize screen for file selection
+		screen, err := tcell.NewScreen()
+		if err != nil {
+			log.Fatal(err)
+		}
+		if err := screen.Init(); err != nil {
+			log.Fatal(err)
+		}
+		defer screen.Fini()
+
+		// Load all flash files
+		var flashFiles []FlashFile
+		for _, f := range files {
+			ff, err := parseFlashFile(f)
+			if err != nil {
+				log.Printf("Error reading %s: %v\n", f, err)
+				continue
+			}
+			flashFiles = append(flashFiles, *ff)
+		}
+
+		if len(flashFiles) == 0 {
+			fmt.Println("No valid .flsh files found")
+			os.Exit(1)
+		}
+
+		selected := showFileSelection(screen, flashFiles)
+		if selected == nil {
+			return
+		}
+		// Instead of modifying os.Args, handle the selected file directly
+		handleRegularReview(selected)
+		return
 	}
 
-	// Check command type
+	// Check command type first
 	switch os.Args[1] {
+	case "new":
+		if len(os.Args) != 3 {
+			fmt.Println("Usage: flash new <name>")
+			fmt.Println("Creates a new flashcard file (will add .flsh extension if not present)")
+			os.Exit(1)
+		}
+		err := createNewFlashFile(os.Args[2])
+		if err != nil {
+			log.Fatal(err)
+		}
+		return
 	case "add":
 		filename := ""
 		if len(os.Args) > 2 {
@@ -257,52 +300,32 @@ func main() {
 		return
 	}
 
+	// Handle regular review (no command)
+	var filename string
+	if filepath.Ext(os.Args[1]) == ".flsh" {
+		filename = os.Args[1]
+	} else {
+		var err error
+		filename, err = findSingleFlashFile()
+		if err != nil {
+			fmt.Println("Usage:")
+			fmt.Println("  Review all cards: flash file.flsh")
+			fmt.Println("  Review wrong cards: flash review file.flsh")
+			fmt.Println("  Add card: flash add file.flsh")
+			fmt.Println("  Create new file: flash new <name>")
+			fmt.Printf("Error: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
 	// Handle direct file path or show file selection
 	var selectedFile *FlashFile
-	if filepath.Ext(os.Args[1]) == ".flsh" {
-		// Direct file path provided
-		ff, err := parseFlashFile(os.Args[1])
-		if err != nil {
-			log.Printf("Error reading %s: %v\n", os.Args[1], err)
-			os.Exit(1)
-		}
-		selectedFile = ff
-	} else {
-		// Show file selection menu
-		var files []FlashFile
-		for _, arg := range os.Args[1:] {
-			if filepath.Ext(arg) != ".flsh" {
-				continue
-			}
-			ff, err := parseFlashFile(arg)
-			if err != nil {
-				log.Printf("Error reading %s: %v\n", arg, err)
-				continue
-			}
-			files = append(files, *ff)
-		}
-
-		if len(files) == 0 {
-			fmt.Println("No valid .flsh files provided")
-			os.Exit(1)
-		}
-
-		// Initialize screen for file selection
-		screen, err := tcell.NewScreen()
-		if err != nil {
-			log.Fatal(err)
-		}
-		if err := screen.Init(); err != nil {
-			log.Fatal(err)
-		}
-		defer screen.Fini()
-
-		selected := showFileSelection(screen, files)
-		if selected == nil {
-			return
-		}
-		selectedFile = selected
+	ff, err := parseFlashFile(filename)
+	if err != nil {
+		log.Printf("Error reading %s: %v\n", filename, err)
+		os.Exit(1)
 	}
+	selectedFile = ff
 
 	// Initialize screen for flashcard review
 	screen, err := tcell.NewScreen()
@@ -312,6 +335,7 @@ func main() {
 	if err := screen.Init(); err != nil {
 		log.Fatal(err)
 	}
+	screen.Clear()
 	defer screen.Fini()
 
 	// Show title page
@@ -356,7 +380,7 @@ func main() {
 
 		// Draw scores and graph side by side
 		drawText(screen, 0, 4, prevScores, styleScore)
-		drawScoreGraph(screen, 40, 4, scoreLines, 30, 10) // Adjust width/height as needed
+		drawScoreGraph(screen, 40, 4, scoreLines, 30, 10)
 
 		drawText(screen, 0, 6+numPrevScoreLines, "Press any key to exit", stylePrompt)
 		screen.Show()
@@ -370,8 +394,6 @@ func main() {
 				if err != nil {
 					log.Fatal(err)
 				}
-				screen.Fini() // Properly close the screen
-				// Print score to terminal before exiting
 				fmt.Printf("%d/%d\n", correct, total)
 				return
 			}
@@ -847,4 +869,102 @@ func reviewWrongCards(filename string) error {
 		fmt.Printf("%d/%d\n", correct, reviewed)
 	}
 	return nil
+}
+
+// Add this new function
+func createNewFlashFile(name string) error {
+	// Add .flsh extension if not present
+	if !strings.HasSuffix(name, ".flsh") {
+		name += ".flsh"
+	}
+
+	// Check if file already exists
+	if _, err := os.Stat(name); err == nil {
+		return fmt.Errorf("file %s already exists", name)
+	}
+
+	// Create new FlashFile
+	ff := &FlashFile{
+		Filename: name,
+		Title:    strings.TrimSuffix(filepath.Base(name), ".flsh"), // Use filename without extension as title
+	}
+
+	// Save the empty file
+	return saveFlashFile(ff)
+}
+
+// Add this new function to handle regular review
+func handleRegularReview(selectedFile *FlashFile) {
+	// Initialize screen for flashcard review
+	screen, err := tcell.NewScreen()
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err := screen.Init(); err != nil {
+		log.Fatal(err)
+	}
+	screen.Clear()
+	defer screen.Fini()
+
+	// Show title page
+	if !showTitlePage(screen, selectedFile) {
+		return // User quit
+	}
+
+	// Run through flashcards
+	correct := 0
+	total := 0
+
+	for i := range selectedFile.Cards {
+		if showCard(screen, &selectedFile.Cards[i]) {
+			// User quit early
+			break
+		}
+		total++
+		if strings.HasSuffix(selectedFile.Cards[i].Reviewed, "Y") {
+			correct++
+		}
+	}
+
+	if total > 0 {
+		// Update stats with timestamp
+		currentTime := time.Now().Format("2006/01/02 15:04")
+		newScore := fmt.Sprintf("%s    %d/%d", currentTime, correct, total)
+		if selectedFile.Stats != "" {
+			selectedFile.Stats += "\n"
+		}
+		selectedFile.Stats += newScore
+
+		// Display score comparison in UI
+		screen.Clear()
+		drawText(screen, 0, 0, "Current score:", styleTitle)
+		drawText(screen, 0, 1, newScore, styleScore)
+		drawText(screen, 0, 3, "Previous scores:", styleTitle)
+
+		// Get previous scores and count lines
+		prevScores := getPreviousScore(selectedFile)
+		scoreLines := strings.Split(prevScores, "\n")
+		numPrevScoreLines := len(scoreLines)
+
+		// Draw scores and graph side by side
+		drawText(screen, 0, 4, prevScores, styleScore)
+		drawScoreGraph(screen, 40, 4, scoreLines, 30, 10)
+
+		drawText(screen, 0, 6+numPrevScoreLines, "Press any key to exit", stylePrompt)
+		screen.Show()
+
+		// Wait for keypress and save
+		for {
+			ev := screen.PollEvent()
+			switch ev.(type) {
+			case *tcell.EventKey:
+				err = saveFlashFile(selectedFile)
+				if err != nil {
+					log.Fatal(err)
+				}
+				fmt.Printf("%d/%d\n", correct, total)
+				return
+			}
+		}
+	}
 }
